@@ -9,6 +9,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -31,11 +33,10 @@ type Order struct {
 }
 
 var (
-	mu      sync.RWMutex
-	users   = make(map[string]User)   // Username -> User
-	tokens  = make(map[string]string) // Token -> Username
-	orders  = make(map[string]*Order) // ID -> Order
-	// Для генерации ID
+	mu           sync.RWMutex
+	users        = make(map[string]User)   // Username -> User
+	tokens       = make(map[string]string) // Token -> Username
+	orders       = make(map[string]*Order) // ID -> Order
 	orderCounter int64 = 0
 )
 
@@ -68,6 +69,8 @@ func EncodeMessage(data map[string]GValue) ([]byte, error) {
 }
 
 func writeFields(buf *bytes.Buffer, data map[string]GValue) error {
+	// Для стабильности тестов (если важен порядок полей) лучше сортировать ключи, 
+	// но в Go map итерация рандомна. Обычно протоколы к порядку полей не чувствительны.
 	for name, val := range data {
 		// Field Name Length
 		if len(name) > 255 {
@@ -203,136 +206,172 @@ func generateToken() string {
 	return hex.EncodeToString(b)
 }
 
+func getUserFromToken(r *http.Request) (string, bool) {
+	authHeader := r.Header.Get("Authorization")
+	if len(authHeader) < 7 || authHeader[:7] != "Bearer " {
+		return "", false
+	}
+	token := authHeader[7:]
+	mu.RLock()
+	defer mu.RUnlock()
+	user, ok := tokens[token]
+	return user, ok
+}
+
 // --- HTTP Handlers ---
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// POST /register
 func registerHandler(w http.ResponseWriter, r *http.Request) {
 	data, err := DecodeMessage(r.Body)
 	if err != nil {
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
-
 	username, _ := data["username"].(string)
 	password, _ := data["password"].(string)
-
 	if username == "" || password == "" {
 		http.Error(w, "Empty fields", http.StatusBadRequest)
 		return
 	}
-
 	mu.Lock()
 	defer mu.Unlock()
-
 	if _, exists := users[username]; exists {
 		http.Error(w, "Conflict", http.StatusConflict)
 		return
 	}
-
 	users[username] = User{Username: username, Password: password}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// POST /login
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	data, err := DecodeMessage(r.Body)
 	if err != nil {
 		http.Error(w, "Bad Request", http.StatusBadRequest)
 		return
 	}
-
 	username, _ := data["username"].(string)
 	password, _ := data["password"].(string)
-
 	mu.Lock()
 	defer mu.Unlock()
-
 	u, exists := users[username]
 	if !exists || u.Password != password {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-
 	token := generateToken()
 	tokens[token] = username
-
 	resp := map[string]GValue{"token": token}
 	encoded, _ := EncodeMessage(resp)
 	w.Header().Set("Content-Type", "application/x-galacticbuf")
 	w.Write(encoded)
 }
 
-// POST /orders (Submit Orders)
-// GET /orders (List Orders - assumed requirement)
+// Handler for /orders
+// GET: List orders (Public)
+// POST: Submit order (Authenticated)
 func ordersHandler(w http.ResponseWriter, r *http.Request) {
-	// 1. Authentication Check
-	authHeader := r.Header.Get("Authorization")
-	if len(authHeader) < 7 || authHeader[:7] != "Bearer " {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	
+	// --- LIST ORDERS (GET) ---
+	if r.Method == http.MethodGet {
+		// 1. Parse Query Params
+		q := r.URL.Query()
+		startStr := q.Get("delivery_start")
+		endStr := q.Get("delivery_end")
+
+		if startStr == "" || endStr == "" {
+			http.Error(w, "Missing query params", http.StatusBadRequest)
+			return
+		}
+
+		start, err1 := strconv.ParseInt(startStr, 10, 64)
+		end, err2 := strconv.ParseInt(endStr, 10, 64)
+		if err1 != nil || err2 != nil {
+			http.Error(w, "Invalid timestamps", http.StatusBadRequest)
+			return
+		}
+
+		mu.RLock()
+		// 2. Filter Orders
+		var filtered []*Order
+		for _, o := range orders {
+			if o.Status == "OPEN" && o.DeliveryStart == start && o.DeliveryEnd == end {
+				filtered = append(filtered, o)
+			}
+		}
+		mu.RUnlock()
+
+		// 3. Sort by Price Ascending (Cheapest first)
+		sort.Slice(filtered, func(i, j int) bool {
+			return filtered[i].Price < filtered[j].Price
+		})
+
+		// 4. Convert to Response Structure
+		list := make([]map[string]GValue, 0, len(filtered))
+		for _, o := range filtered {
+			list = append(list, map[string]GValue{
+				"order_id":       o.ID,
+				"price":          o.Price,
+				"quantity":       o.Quantity,
+				"delivery_start": o.DeliveryStart,
+				"delivery_end":   o.DeliveryEnd,
+			})
+		}
+
+		resp := map[string]GValue{"orders": list}
+		encoded, _ := EncodeMessage(resp)
+		w.Header().Set("Content-Type", "application/x-galacticbuf")
+		w.Write(encoded)
 		return
 	}
-	token := authHeader[7:]
 
-	mu.RLock()
-	username, authOk := tokens[token]
-	mu.RUnlock()
-
-	if !authOk {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
+	// --- SUBMIT ORDER (POST) ---
 	if r.Method == http.MethodPost {
-		// SUBMIT ORDER
+		username, authOk := getUserFromToken(r)
+		if !authOk {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
 		data, err := DecodeMessage(r.Body)
 		if err != nil {
-			log.Printf("Order decode error: %v", err)
 			http.Error(w, "Bad Request", http.StatusBadRequest)
 			return
 		}
 
-		// Extract and Validate Fields
 		price, ok1 := data["price"].(int64)
 		quantity, ok2 := data["quantity"].(int64)
 		start, ok3 := data["delivery_start"].(int64)
 		end, ok4 := data["delivery_end"].(int64)
 
 		if !ok1 || !ok2 || !ok3 || !ok4 {
-			http.Error(w, "Missing/Invalid fields", http.StatusBadRequest)
+			http.Error(w, "Missing fields", http.StatusBadRequest)
 			return
 		}
 
-		// Logic Validation
-		// 1. Quantity must be positive
 		if quantity <= 0 {
 			http.Error(w, "Quantity must be positive", http.StatusBadRequest)
 			return
 		}
-		// 2. Timestamps aligned to 1-hour boundaries (3600000 ms)
 		const hourMs = 3600000
 		if start%hourMs != 0 || end%hourMs != 0 {
-			http.Error(w, "Timestamps not aligned", http.StatusBadRequest)
+			http.Error(w, "Timestamps alignment error", http.StatusBadRequest)
 			return
 		}
-		// 3. End > Start
 		if end <= start {
-			http.Error(w, "End must be > Start", http.StatusBadRequest)
+			http.Error(w, "End <= Start", http.StatusBadRequest)
 			return
 		}
-		// 4. Duration exactly 1 hour
 		if (end - start) != hourMs {
-			http.Error(w, "Duration must be 1 hour", http.StatusBadRequest)
+			http.Error(w, "Must be 1 hour", http.StatusBadRequest)
 			return
 		}
 
-		// Create Order
 		mu.Lock()
 		orderCounter++
-		orderID := fmt.Sprintf("ord-%d-%s", orderCounter, username)
+		orderID := fmt.Sprintf("ord-%d", orderCounter) // Simple ID
 		newOrder := &Order{
 			ID:            orderID,
 			Price:         price,
@@ -345,98 +384,67 @@ func ordersHandler(w http.ResponseWriter, r *http.Request) {
 		orders[orderID] = newOrder
 		mu.Unlock()
 
-		// Response
 		resp := map[string]GValue{"order_id": orderID}
 		encoded, _ := EncodeMessage(resp)
 		w.Header().Set("Content-Type", "application/x-galacticbuf")
 		w.Write(encoded)
 		return
 	}
-
-	if r.Method == http.MethodGet {
-		// LIST ORDERS (Simple implementation)
-		mu.RLock()
-		defer mu.RUnlock()
-		
-		// Typically list orders returns a list of objects
-		list := make([]map[string]GValue, 0)
-		for _, o := range orders {
-			if o.Status == "OPEN" {
-				list = append(list, map[string]GValue{
-					"id":             o.ID,
-					"price":          o.Price,
-					"quantity":       o.Quantity,
-					"delivery_start": o.DeliveryStart,
-					"delivery_end":   o.DeliveryEnd,
-				})
-			}
-		}
-		resp := map[string]GValue{"orders": list}
-		encoded, _ := EncodeMessage(resp)
-		w.Header().Set("Content-Type", "application/x-galacticbuf")
-		w.Write(encoded)
-	}
 }
 
-// POST /trades (Take Order) - from previous context
+// POST /trades (Take Order)
 func tradesHandler(w http.ResponseWriter, r *http.Request) {
-	// Auth check
-	authHeader := r.Header.Get("Authorization")
-	if len(authHeader) < 7 || authHeader[:7] != "Bearer " {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-	token := authHeader[7:]
-	mu.RLock()
-	_, authOk := tokens[token]
-	mu.RUnlock()
+	// Authentication Required
+	_, authOk := getUserFromToken(r)
 	if !authOk {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	if r.Method == http.MethodPost {
-		data, err := DecodeMessage(r.Body)
-		if err != nil {
-			http.Error(w, "Bad Request", http.StatusBadRequest)
-			return
-		}
-
-		orderID, ok := data["order_id"].(string)
-		if !ok {
-			http.Error(w, "Missing order_id", http.StatusBadRequest)
-			return
-		}
-
-		mu.Lock()
-		defer mu.Unlock()
-
-		order, exists := orders[orderID]
-		if !exists || order.Status != "OPEN" {
-			http.Error(w, "Order not found/filled", http.StatusNotFound)
-			return
-		}
-
-		order.Status = "FILLED"
-		tradeID := fmt.Sprintf("trd-%d", time.Now().UnixNano())
-
-		resp := map[string]GValue{"trade_id": tradeID}
-		encoded, _ := EncodeMessage(resp)
-		w.Header().Set("Content-Type", "application/x-galacticbuf")
-		w.Write(encoded)
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
+
+	data, err := DecodeMessage(r.Body)
+	if err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	orderID, ok := data["order_id"].(string)
+	if !ok {
+		http.Error(w, "Missing order_id", http.StatusBadRequest)
+		return
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	order, exists := orders[orderID]
+	// "Order doesn't exist or is not active" -> 404
+	if !exists || order.Status != "OPEN" {
+		http.Error(w, "Order not found", http.StatusNotFound)
+		return
+	}
+
+	// Logic: Change status to FILLED
+	order.Status = "FILLED"
+	
+	// Create a Trade ID
+	tradeID := fmt.Sprintf("trade-%s-%d", order.ID, time.Now().UnixNano())
+
+	resp := map[string]GValue{"trade_id": tradeID}
+	encoded, _ := EncodeMessage(resp)
+	w.Header().Set("Content-Type", "application/x-galacticbuf")
+	w.Write(encoded)
 }
 
-// Middleware to log requests (helps debug)
 func loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		r.Body = io.NopCloser(bytes.NewBuffer(body))
-		
-		log.Printf("REQ: %s %s", r.Method, r.URL.Path)
-		if len(body) > 0 {
-			log.Printf("BODY (Hex): %s", hex.EncodeToString(body))
-		}
+		// Log basic info. Careful with body reading in production/high load.
+		// For hackathon debugging it's fine.
+		log.Printf("%s %s", r.Method, r.URL.String())
 		next(w, r)
 	}
 }
@@ -450,7 +458,7 @@ func main() {
 	mux.HandleFunc("/orders", ordersHandler)
 	mux.HandleFunc("/trades", tradesHandler)
 
-	log.Println("Galactic Exchange started on :8080")
+	log.Println("Server listening on :8080")
 	if err := http.ListenAndServe(":8080", loggingMiddleware(mux.ServeHTTP)); err != nil {
 		log.Fatal(err)
 	}
