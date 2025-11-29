@@ -29,7 +29,7 @@ type Order struct {
 	DeliveryStart int64
 	DeliveryEnd   int64
 	Owner         string // Username
-	Status        string // "OPEN", "FILLED"
+	Status        string // "OPEN", "FILLED", "CANCELLED"
 	Side          string // "buy" or "sell"
 	Version       int    // 1 or 2
 	Timestamp     int64  // Time of submission (Created At)
@@ -470,6 +470,18 @@ func codonEditDistanceBounded(a, b []string, limit int) int {
 	return limit + 1
 }
 
+// Map internal order status to external API status
+// OPEN -> ACTIVE, FILLED -> FILLED, others passed through
+func externalStatus(status string) string {
+	if status == "FILLED" {
+		return "FILLED"
+	}
+	if status == "OPEN" {
+		return "ACTIVE"
+	}
+	return status
+}
+
 // --- HTTP Handlers ---
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -781,6 +793,7 @@ func ordersV1Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 }
+
 // Helper to match order against the book
 // Assumes mu is locked
 func matchOrder(order *Order) int64 {
@@ -865,7 +878,6 @@ func matchOrder(order *Order) int64 {
 
 	return filledQty
 }
-
 
 // V2 Orders Handler (V2 Order Book & V2 Submit)
 func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
@@ -1023,11 +1035,9 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 		}
 		mu.Unlock()
 
-		status := newOrder.Status
-
 		resp := map[string]GValue{
 			"order_id":        orderID,
-			"status":          status,
+			"status":          externalStatus(newOrder.Status),
 			"filled_quantity": filledQty,
 		}
 		encoded, _ := EncodeMessage(resp)
@@ -1125,7 +1135,7 @@ func modifyOrderHandler(w http.ResponseWriter, r *http.Request, orderID string) 
 
 	resp := map[string]GValue{
 		"order_id":        orderID,
-		"status":          order.Status,
+		"status":          externalStatus(order.Status),
 		"filled_quantity": filledQty,
 	}
 	encoded, _ := EncodeMessage(resp)
