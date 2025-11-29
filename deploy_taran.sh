@@ -18,8 +18,8 @@ echo "$PASSWORD" | docker login "$REGISTRY" -u "$USERNAME" --password-stdin
 
 echo "2. Preparing buildx builder..."
 # создаём билдера, если его ещё нет
-docker buildx create --name energyhack-builder --use >/dev/null 2>&1  docker buildx use energyhack-builder
-docker buildx inspect >/dev/null 2>&1  docker buildx inspect --bootstrap
+docker buildx create --name energyhack-builder --use >/dev/null 2>&1 || docker buildx use energyhack-builder
+docker buildx inspect >/dev/null 2>&1 || docker buildx inspect --bootstrap
 
 echo "3. Building and pushing multi-arch image..."
 docker buildx build \

@@ -7,6 +7,7 @@ REGISTRY="registry.k8s.energyhack.cz"
 USERNAME="arkadiy.panov"
 PASSWORD="WWMvesEm2V8VaFE9GLzY"
 PROJECT="nuclear-elephants/galactic-energy-exchange"
+PLATFORM=${PLATFORM:-"linux/amd64"} # force AMD64 by default
 
 TAG=${1:-"v1"}
 FULL_IMAGE_NAME="$REGISTRY/$PROJECT:$TAG"
@@ -18,12 +19,18 @@ echo "$PASSWORD" | docker login "$REGISTRY" -u "$USERNAME" --password-stdin
 
 echo "2. Preparing buildx builder..."
 # создаём билдера, если его ещё нет
-docker buildx create --name energyhack-builder --use >/dev/null 2>&1  docker buildx use energyhack-builder
-docker buildx inspect >/dev/null 2>&1  docker buildx inspect --bootstrap
+if ! docker buildx inspect energyhack-builder >/dev/null 2>&1; then
+  docker buildx create --name energyhack-builder --use >/dev/null
+else
+  docker buildx use energyhack-builder >/dev/null
+fi
+docker buildx inspect --bootstrap >/dev/null
 
-echo "3. Building and pushing multi-arch image..."
+echo "3. Building and pushing image for platform: $PLATFORM ..."
 docker buildx build \
-  --platform linux/amd64,linux/arm64 \
+  --platform "$PLATFORM" \
+  --provenance=false \
+  --sbom=false \
   -t "$FULL_IMAGE_NAME" \
   --push .
 
