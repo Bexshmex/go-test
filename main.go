@@ -781,6 +781,91 @@ func ordersV1Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 }
+// Helper to match order against the book
+// Assumes mu is locked
+func matchOrder(order *Order) int64 {
+	var filledQty int64 = 0
+	var matchingOrders []*Order
+
+	// Find matching orders
+	for _, o := range orders {
+		if o.Version == 2 && o.Status == "OPEN" && o.DeliveryStart == order.DeliveryStart && o.DeliveryEnd == order.DeliveryEnd {
+			if order.Side == "buy" && o.Side == "sell" && order.Price >= o.Price {
+				matchingOrders = append(matchingOrders, o)
+			} else if order.Side == "sell" && o.Side == "buy" && order.Price <= o.Price {
+				matchingOrders = append(matchingOrders, o)
+			}
+		}
+	}
+
+	// Sort matching orders
+	if order.Side == "buy" {
+		sort.Slice(matchingOrders, func(i, j int) bool {
+			if matchingOrders[i].Price != matchingOrders[j].Price {
+				return matchingOrders[i].Price < matchingOrders[j].Price
+			}
+			return matchingOrders[i].Timestamp < matchingOrders[j].Timestamp
+		})
+	} else {
+		sort.Slice(matchingOrders, func(i, j int) bool {
+			if matchingOrders[i].Price != matchingOrders[j].Price {
+				return matchingOrders[i].Price > matchingOrders[j].Price
+			}
+			return matchingOrders[i].Timestamp < matchingOrders[j].Timestamp
+		})
+	}
+
+	now := time.Now().UnixMilli()
+
+	// Execute matches
+	for _, matchOrder := range matchingOrders {
+		if order.Quantity <= 0 {
+			break
+		}
+
+		tradeQty := order.Quantity
+		if matchOrder.Quantity < tradeQty {
+			tradeQty = matchOrder.Quantity
+		}
+
+		tradePrice := matchOrder.Price
+
+		var buyerID, sellerID string
+		if order.Side == "buy" {
+			buyerID = order.Owner
+			sellerID = matchOrder.Owner
+		} else {
+			buyerID = matchOrder.Owner
+			sellerID = order.Owner
+		}
+
+		tradeID := fmt.Sprintf("trd-%s-%d", matchOrder.ID, now)
+		newTrade := &Trade{
+			ID:        tradeID,
+			BuyerID:   buyerID,
+			SellerID:  sellerID,
+			Price:     tradePrice,
+			Quantity:  tradeQty,
+			Timestamp: now,
+		}
+		trades = append(trades, newTrade)
+
+		order.Quantity -= tradeQty
+		filledQty += tradeQty
+		matchOrder.Quantity -= tradeQty
+
+		if matchOrder.Quantity <= 0 {
+			matchOrder.Status = "FILLED"
+		}
+	}
+
+	if order.Quantity <= 0 {
+		order.Status = "FILLED"
+	}
+
+	return filledQty
+}
+
 
 // V2 Orders Handler (V2 Order Book & V2 Submit)
 func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
@@ -917,114 +1002,28 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 		orderID := fmt.Sprintf("ord-v2-%d", orderCounter)
 		now := time.Now().UnixMilli()
 
-		// Track filled quantity for the incoming order
-		remainingQty := quantity
-		var filledQty int64 = 0
-
-		// Find matching orders from the opposite side
-		var matchingOrders []*Order
-		for _, o := range orders {
-			if o.Version == 2 && o.Status == "OPEN" && o.DeliveryStart == start && o.DeliveryEnd == end {
-				if side == "buy" && o.Side == "sell" && price >= o.Price {
-					// Buy order matches sell orders where buy_price >= sell_price
-					matchingOrders = append(matchingOrders, o)
-				} else if side == "sell" && o.Side == "buy" && price <= o.Price {
-					// Sell order matches buy orders where sell_price <= buy_price
-					matchingOrders = append(matchingOrders, o)
-				}
-			}
+		newOrder := &Order{
+			ID:            orderID,
+			Price:         price,
+			Quantity:      quantity,
+			DeliveryStart: start,
+			DeliveryEnd:   end,
+			Owner:         username,
+			Status:        "OPEN",
+			Side:          side,
+			Version:       2,
+			Timestamp:     now,
 		}
 
-		// Sort matching orders by price-time priority
-		if side == "buy" {
-			// For incoming buy: match cheapest sells first, then oldest first
-			sort.Slice(matchingOrders, func(i, j int) bool {
-				if matchingOrders[i].Price != matchingOrders[j].Price {
-					return matchingOrders[i].Price < matchingOrders[j].Price // Lowest price first
-				}
-				return matchingOrders[i].Timestamp < matchingOrders[j].Timestamp // Oldest first
-			})
-		} else {
-			// For incoming sell: match highest bids first, then oldest first
-			sort.Slice(matchingOrders, func(i, j int) bool {
-				if matchingOrders[i].Price != matchingOrders[j].Price {
-					return matchingOrders[i].Price > matchingOrders[j].Price // Highest price first
-				}
-				return matchingOrders[i].Timestamp < matchingOrders[j].Timestamp // Oldest first
-			})
-		}
-
-		// Execute matches
-		for _, matchOrder := range matchingOrders {
-			if remainingQty <= 0 {
-				break
-			}
-
-			// Determine trade quantity
-			tradeQty := remainingQty
-			if matchOrder.Quantity < tradeQty {
-				tradeQty = matchOrder.Quantity
-			}
-
-			// Determine trade price (resting/maker order's price)
-			tradePrice := matchOrder.Price
-
-			// Determine buyer and seller
-			var buyerID, sellerID string
-			if side == "buy" {
-				buyerID = username
-				sellerID = matchOrder.Owner
-			} else {
-				buyerID = matchOrder.Owner
-				sellerID = username
-			}
-
-			// Create trade record
-			tradeID := fmt.Sprintf("trd-%s-%d", matchOrder.ID, now)
-			newTrade := &Trade{
-				ID:        tradeID,
-				BuyerID:   buyerID,
-				SellerID:  sellerID,
-				Price:     tradePrice,
-				Quantity:  tradeQty,
-				Timestamp: now,
-			}
-			trades = append(trades, newTrade)
-
-			// Update quantities
-			remainingQty -= tradeQty
-			filledQty += tradeQty
-			matchOrder.Quantity -= tradeQty
-
-			// Update matching order status
-			if matchOrder.Quantity <= 0 {
-				matchOrder.Status = "FILLED"
-			}
-		}
-
-		// Determine final status for incoming order
-		status := "ACTIVE"
-		if remainingQty <= 0 {
-			status = "FILLED"
-		}
+		filledQty := matchOrder(newOrder)
 
 		// Only insert into order book if not fully filled
-		if remainingQty > 0 {
-			newOrder := &Order{
-				ID:            orderID,
-				Price:         price,
-				Quantity:      remainingQty,
-				DeliveryStart: start,
-				DeliveryEnd:   end,
-				Owner:         username,
-				Status:        "OPEN",
-				Side:          side,
-				Version:       2,
-				Timestamp:     now,
-			}
+		if newOrder.Status != "FILLED" {
 			orders[orderID] = newOrder
 		}
 		mu.Unlock()
+
+		status := newOrder.Status
 
 		resp := map[string]GValue{
 			"order_id":        orderID,
@@ -1038,6 +1037,132 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+}
+
+func orderOperationHandler(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Path[len("/v2/orders/"):]
+	if id == "" {
+		ordersV2Handler(w, r)
+		return
+	}
+
+	if r.Method == http.MethodPut {
+		modifyOrderHandler(w, r, id)
+		return
+	}
+	if r.Method == http.MethodDelete {
+		cancelOrderHandler(w, r, id)
+		return
+	}
+	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+}
+
+func modifyOrderHandler(w http.ResponseWriter, r *http.Request, orderID string) {
+	username, authOk := getUserFromToken(r)
+	if !authOk {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	data, err := DecodeMessage(r.Body)
+	if err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	price, ok1 := data["price"].(int64)
+	quantity, ok2 := data["quantity"].(int64)
+	if !ok1 || !ok2 {
+		http.Error(w, "Missing fields", http.StatusBadRequest)
+		return
+	}
+	if quantity <= 0 {
+		http.Error(w, "Quantity must be positive", http.StatusBadRequest)
+		return
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	order, exists := orders[orderID]
+	if !exists || order.Status == "CANCELLED" {
+		http.Error(w, "Order not found", http.StatusNotFound)
+		return
+	}
+	if order.Status == "FILLED" {
+		http.Error(w, "Order is fully filled", http.StatusNotFound)
+		return
+	}
+	if order.Owner != username {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+	if order.Version != 2 {
+		http.Error(w, "Order not found", http.StatusNotFound) // Only V2 orders
+		return
+	}
+
+	// Update Logic
+	resetPriority := false
+	if price != order.Price {
+		resetPriority = true
+	}
+	if quantity > order.Quantity {
+		resetPriority = true
+	}
+
+	order.Price = price
+	order.Quantity = quantity
+	if resetPriority {
+		now := time.Now().UnixMilli()
+		if now <= order.Timestamp {
+			now = order.Timestamp + 1
+		}
+		order.Timestamp = now
+	}
+
+	filledQty := matchOrder(order)
+
+	resp := map[string]GValue{
+		"order_id":        orderID,
+		"status":          order.Status,
+		"filled_quantity": filledQty,
+	}
+	encoded, _ := EncodeMessage(resp)
+	w.Header().Set("Content-Type", "application/x-galacticbuf")
+	w.Write(encoded)
+}
+
+func cancelOrderHandler(w http.ResponseWriter, r *http.Request, orderID string) {
+	username, authOk := getUserFromToken(r)
+	if !authOk {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	order, exists := orders[orderID]
+	if !exists || order.Status == "CANCELLED" {
+		http.Error(w, "Order not found", http.StatusNotFound)
+		return
+	}
+	if order.Status == "FILLED" {
+		http.Error(w, "Order is fully filled", http.StatusNotFound)
+		return
+	}
+	if order.Owner != username {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+	if order.Version != 2 {
+		http.Error(w, "Order not found", http.StatusNotFound) // Only V2 orders
+		return
+	}
+
+	order.Status = "CANCELLED"
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func myOrdersHandler(w http.ResponseWriter, r *http.Request) {
@@ -1187,6 +1312,7 @@ func main() {
 
 	mux.HandleFunc("/orders", ordersV1Handler)
 	mux.HandleFunc("/v2/orders", ordersV2Handler)
+	mux.HandleFunc("/v2/orders/", orderOperationHandler)
 	mux.HandleFunc("/v2/my-orders", myOrdersHandler)
 
 	mux.HandleFunc("/trades", tradesHandler)
