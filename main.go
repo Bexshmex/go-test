@@ -28,8 +28,12 @@ type Order struct {
 	Quantity      int64
 	DeliveryStart int64
 	DeliveryEnd   int64
-	Owner         string // Seller Username
+	Owner         string // Username
 	Status        string // "OPEN", "FILLED"
+	
+	// Новые поля для V2
+	Side    string // "buy" или "sell"
+	Version int    // 1 или 2
 }
 
 type Trade struct {
@@ -80,12 +84,10 @@ func EncodeMessage(data map[string]GValue) ([]byte, error) {
 
 func writeFields(buf *bytes.Buffer, data map[string]GValue) error {
 	for name, val := range data {
-		// Field Name Length
 		if len(name) > 255 {
 			return fmt.Errorf("field name too long")
 		}
 		buf.WriteByte(byte(len(name)))
-		// Field Name
 		buf.WriteString(name)
 
 		switch v := val.(type) {
@@ -123,7 +125,6 @@ func writeFields(buf *bytes.Buffer, data map[string]GValue) error {
 func DecodeMessage(r io.Reader) (map[string]GValue, error) {
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(r, header); err != nil {
-		// Handle empty body gracefully if needed, though protocol says header exists
 		if err == io.EOF {
 			return nil, err
 		}
@@ -233,7 +234,6 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// POST /register
 func registerHandler(w http.ResponseWriter, r *http.Request) {
 	data, err := DecodeMessage(r.Body)
 	if err != nil {
@@ -258,7 +258,6 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// POST /login
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	data, err := DecodeMessage(r.Body)
 	if err != nil {
@@ -284,7 +283,6 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(encoded)
 }
 
-// PUT /user/password (Change Password)
 func passwordHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -315,12 +313,9 @@ func passwordHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Change Password
 	u.Password = newPass
 	users[username] = u
 
-	// 2. Invalidate ALL existing tokens for this user
-	// Note: Deleting from map while iterating is safe in Go
 	for token, user := range tokens {
 		if user == username {
 			delete(tokens, token)
@@ -330,10 +325,10 @@ func passwordHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// GET /orders (List) & POST /orders (Submit)
-func ordersHandler(w http.ResponseWriter, r *http.Request) {
+// --- V1 ORDERS HANDLER ---
+func ordersV1Handler(w http.ResponseWriter, r *http.Request) {
 	
-	// --- LIST ORDERS (GET - Public) ---
+	// GET /orders (V1 List - Public)
 	if r.Method == http.MethodGet {
 		q := r.URL.Query()
 		startStr := q.Get("delivery_start")
@@ -354,7 +349,8 @@ func ordersHandler(w http.ResponseWriter, r *http.Request) {
 		mu.RLock()
 		var filtered []*Order
 		for _, o := range orders {
-			if o.Status == "OPEN" && o.DeliveryStart == start && o.DeliveryEnd == end {
+			// ВАЖНО: Фильтруем только V1 ордера
+			if o.Version == 1 && o.Status == "OPEN" && o.DeliveryStart == start && o.DeliveryEnd == end {
 				filtered = append(filtered, o)
 			}
 		}
@@ -382,7 +378,7 @@ func ordersHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- SUBMIT ORDER (POST - Auth Required) ---
+	// POST /orders (V1 Submit - Auth Required)
 	if r.Method == http.MethodPost {
 		username, authOk := getUserFromToken(r)
 		if !authOk {
@@ -426,6 +422,9 @@ func ordersHandler(w http.ResponseWriter, r *http.Request) {
 			DeliveryEnd:   end,
 			Owner:         username,
 			Status:        "OPEN",
+			// ВАЖНО: V1 это всегда sell и версия 1
+			Side:    "sell",
+			Version: 1,
 		}
 		orders[orderID] = newOrder
 		mu.Unlock()
@@ -438,18 +437,87 @@ func ordersHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// GET /trades (List) & POST /trades (Take)
+// --- V2 ORDERS HANDLER (NEW) ---
+func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	username, authOk := getUserFromToken(r)
+	if !authOk {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	data, err := DecodeMessage(r.Body)
+	if err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	side, ok0 := data["side"].(string)
+	price, ok1 := data["price"].(int64)
+	quantity, ok2 := data["quantity"].(int64)
+	start, ok3 := data["delivery_start"].(int64)
+	end, ok4 := data["delivery_end"].(int64)
+
+	if !ok0 || !ok1 || !ok2 || !ok3 || !ok4 {
+		http.Error(w, "Missing fields", http.StatusBadRequest)
+		return
+	}
+
+	// V2 Specific Validation: Side
+	if side != "buy" && side != "sell" {
+		http.Error(w, "Invalid side", http.StatusBadRequest)
+		return
+	}
+
+	// Standard Validation (Same as V1)
+	if quantity <= 0 {
+		http.Error(w, "Quantity must be positive", http.StatusBadRequest)
+		return
+	}
+	const hourMs = 3600000
+	if start%hourMs != 0 || end%hourMs != 0 || end <= start || (end-start) != hourMs {
+		http.Error(w, "Invalid Contract Timestamps", http.StatusBadRequest)
+		return
+	}
+
+	mu.Lock()
+	orderCounter++
+	orderID := fmt.Sprintf("ord-v2-%d", orderCounter)
+	newOrder := &Order{
+		ID:            orderID,
+		Price:         price,
+		Quantity:      quantity,
+		DeliveryStart: start,
+		DeliveryEnd:   end,
+		Owner:         username,
+		Status:        "OPEN",
+		// ВАЖНО: V2 поля
+		Side:    side,
+		Version: 2,
+	}
+	orders[orderID] = newOrder
+	mu.Unlock()
+
+	resp := map[string]GValue{"order_id": orderID}
+	encoded, _ := EncodeMessage(resp)
+	w.Header().Set("Content-Type", "application/x-galacticbuf")
+	w.Write(encoded)
+}
+
+// --- TRADES HANDLER (V1) ---
 func tradesHandler(w http.ResponseWriter, r *http.Request) {
 	
-	// --- LIST TRADES (GET - Public) ---
+	// GET /trades (List - Public)
 	if r.Method == http.MethodGet {
 		mu.RLock()
-		// Make a copy to sort
 		resultTrades := make([]*Trade, len(trades))
 		copy(resultTrades, trades)
 		mu.RUnlock()
 
-		// Sort: Newest first (Descending Timestamp)
 		sort.Slice(resultTrades, func(i, j int) bool {
 			return resultTrades[i].Timestamp > resultTrades[j].Timestamp
 		})
@@ -473,7 +541,7 @@ func tradesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- TAKE ORDER (POST - Auth Required) ---
+	// POST /trades (Take Order V1 - Auth Required)
 	if r.Method == http.MethodPost {
 		buyerUser, authOk := getUserFromToken(r)
 		if !authOk {
@@ -496,16 +564,15 @@ func tradesHandler(w http.ResponseWriter, r *http.Request) {
 		defer mu.Unlock()
 
 		order, exists := orders[orderID]
-		if !exists || order.Status != "OPEN" {
+		// Добавлена проверка на версию: V1 эндпоинт не может покупать V2 ордера
+		if !exists || order.Status != "OPEN" || order.Version != 1 {
 			http.Error(w, "Order not found or inactive", http.StatusNotFound)
 			return
 		}
 
-		// Update Order Status
 		order.Status = "FILLED"
 		
-		// Create Trade Record
-		now := time.Now().UnixMilli() // Milliseconds usually required for these timestamps
+		now := time.Now().UnixMilli()
 		tradeID := fmt.Sprintf("trd-%s-%d", order.ID, now)
 		
 		newTrade := &Trade{
@@ -525,7 +592,6 @@ func tradesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Log wrapper
 func loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s", r.Method, r.URL.String())
@@ -539,8 +605,9 @@ func main() {
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/register", registerHandler)
 	mux.HandleFunc("/login", loginHandler)
-	mux.HandleFunc("/user/password", passwordHandler) // New endpoint
-	mux.HandleFunc("/orders", ordersHandler)
+	mux.HandleFunc("/user/password", passwordHandler)
+	mux.HandleFunc("/orders", ordersV1Handler) // Старый V1
+	mux.HandleFunc("/v2/orders", ordersV2Handler) // Новый V2
 	mux.HandleFunc("/trades", tradesHandler)
 
 	log.Println("Galactic Exchange started on :8080")
