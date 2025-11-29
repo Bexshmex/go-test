@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
@@ -30,10 +29,10 @@ type Order struct {
 	DeliveryStart int64
 	DeliveryEnd   int64
 	Owner         string // Username
-	Status        string // "OPEN", "FILLED", "CANCELLED"
+	Status        string // "OPEN", "FILLED"
 	Side          string // "buy" or "sell"
 	Version       int    // 1 or 2
-	Timestamp     int64  // Time of submission (for priority)
+	Timestamp     int64  // Time of submission (Created At)
 }
 
 type Trade struct {
@@ -147,6 +146,7 @@ func DecodeMessage(r io.Reader) (map[string]GValue, error) {
 	}
 }
 
+// V1 Logic
 func decodeV1(r io.Reader) (map[string]GValue, error) {
 	headerRem := make([]byte, 3)
 	if _, err := io.ReadFull(r, headerRem); err != nil {
@@ -160,15 +160,24 @@ func readFieldsV1(r io.Reader, count int) (map[string]GValue, error) {
 	result := make(map[string]GValue)
 	for i := 0; i < count; i++ {
 		var nameLen uint8
-		binary.Read(r, binary.BigEndian, &nameLen)
+		if err := binary.Read(r, binary.BigEndian, &nameLen); err != nil {
+			return nil, err
+		}
 		nameBytes := make([]byte, nameLen)
-		io.ReadFull(r, nameBytes)
+		if _, err := io.ReadFull(r, nameBytes); err != nil {
+			return nil, err
+		}
 		fieldName := string(nameBytes)
 
 		var typeInd uint8
-		binary.Read(r, binary.BigEndian, &typeInd)
+		if err := binary.Read(r, binary.BigEndian, &typeInd); err != nil {
+			return nil, err
+		}
 
-		val, _ := readValueV1(r, typeInd)
+		val, err := readValueV1(r, typeInd)
+		if err != nil {
+			return nil, err
+		}
 		result[fieldName] = val
 	}
 	return result, nil
@@ -178,13 +187,19 @@ func readValueV1(r io.Reader, typeInd uint8) (GValue, error) {
 	switch typeInd {
 	case TypeInt:
 		var v int64
-		binary.Read(r, binary.BigEndian, &v)
+		if err := binary.Read(r, binary.BigEndian, &v); err != nil {
+			return nil, err
+		}
 		return v, nil
 	case TypeString:
 		var l uint16
-		binary.Read(r, binary.BigEndian, &l)
+		if err := binary.Read(r, binary.BigEndian, &l); err != nil {
+			return nil, err
+		}
 		buf := make([]byte, l)
-		io.ReadFull(r, buf)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, err
+		}
 		return string(buf), nil
 	case TypeList:
 		var elemType uint8
@@ -209,10 +224,11 @@ func readValueV1(r io.Reader, typeInd uint8) (GValue, error) {
 		binary.Read(r, binary.BigEndian, &fc)
 		return readFieldsV1(r, int(fc))
 	default:
-		return nil, nil
+		return nil, fmt.Errorf("unknown type V1 %x", typeInd)
 	}
 }
 
+// V2 Logic
 func decodeV2(r io.Reader) (map[string]GValue, error) {
 	headerRem := make([]byte, 5)
 	if _, err := io.ReadFull(r, headerRem); err != nil {
@@ -226,15 +242,24 @@ func readFieldsV2(r io.Reader, count int) (map[string]GValue, error) {
 	result := make(map[string]GValue)
 	for i := 0; i < count; i++ {
 		var nameLen uint8
-		binary.Read(r, binary.BigEndian, &nameLen)
+		if err := binary.Read(r, binary.BigEndian, &nameLen); err != nil {
+			return nil, err
+		}
 		nameBytes := make([]byte, nameLen)
-		io.ReadFull(r, nameBytes)
+		if _, err := io.ReadFull(r, nameBytes); err != nil {
+			return nil, err
+		}
 		fieldName := string(nameBytes)
 
 		var typeInd uint8
-		binary.Read(r, binary.BigEndian, &typeInd)
+		if err := binary.Read(r, binary.BigEndian, &typeInd); err != nil {
+			return nil, err
+		}
 
-		val, _ := readValueV2(r, typeInd)
+		val, err := readValueV2(r, typeInd)
+		if err != nil {
+			return nil, err
+		}
 		result[fieldName] = val
 	}
 	return result, nil
@@ -244,28 +269,44 @@ func readValueV2(r io.Reader, typeInd uint8) (GValue, error) {
 	switch typeInd {
 	case TypeInt:
 		var v int64
-		binary.Read(r, binary.BigEndian, &v)
+		if err := binary.Read(r, binary.BigEndian, &v); err != nil {
+			return nil, err
+		}
 		return v, nil
 	case TypeString:
 		var l uint32
-		binary.Read(r, binary.BigEndian, &l)
-		if l > 100*1024*1024 { return nil, fmt.Errorf("limit") }
+		if err := binary.Read(r, binary.BigEndian, &l); err != nil {
+			return nil, err
+		}
+		if l > 100*1024*1024 {
+			return nil, fmt.Errorf("string too large")
+		}
 		buf := make([]byte, l)
-		io.ReadFull(r, buf)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, err
+		}
 		return string(buf), nil
 	case TypeBytes:
 		var l uint32
-		binary.Read(r, binary.BigEndian, &l)
-		if l > 100*1024*1024 { return nil, fmt.Errorf("limit") }
+		if err := binary.Read(r, binary.BigEndian, &l); err != nil {
+			return nil, err
+		}
+		if l > 100*1024*1024 {
+			return nil, fmt.Errorf("bytes too large")
+		}
 		buf := make([]byte, l)
-		io.ReadFull(r, buf)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, err
+		}
 		return buf, nil
 	case TypeList:
 		var elemType uint8
 		binary.Read(r, binary.BigEndian, &elemType)
 		var count uint32
 		binary.Read(r, binary.BigEndian, &count)
-		if count > 100000 { return nil, fmt.Errorf("limit") }
+		if count > 100000 {
+			return nil, fmt.Errorf("list too large")
+		}
 		list := make([]GValue, 0, count)
 		for k := 0; k < int(count); k++ {
 			if elemType == TypeObject {
@@ -284,7 +325,7 @@ func readValueV2(r io.Reader, typeInd uint8) (GValue, error) {
 		binary.Read(r, binary.BigEndian, &fc)
 		return readFieldsV2(r, int(fc))
 	default:
-		return nil, nil
+		return nil, fmt.Errorf("unknown type V2 %x", typeInd)
 	}
 }
 
@@ -405,7 +446,7 @@ func passwordHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// V1 Orders Handler
+// V1 Orders Handler (V1 List & V1 Submit)
 func ordersV1Handler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		q := r.URL.Query()
@@ -513,179 +554,153 @@ func ordersV1Handler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// V2 Orders Handler (Submit)
+// V2 Orders Handler (V2 Order Book & V2 Submit)
 func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+	
+	// GET /v2/orders (ORDER BOOK - Public)
+	if r.Method == http.MethodGet {
+		q := r.URL.Query()
+		startStr := q.Get("delivery_start")
+		endStr := q.Get("delivery_end")
+
+		if startStr == "" || endStr == "" {
+			http.Error(w, "Missing query params", http.StatusBadRequest)
+			return
+		}
+
+		start, err1 := strconv.ParseInt(startStr, 10, 64)
+		end, err2 := strconv.ParseInt(endStr, 10, 64)
+		if err1 != nil || err2 != nil {
+			http.Error(w, "Invalid timestamps", http.StatusBadRequest)
+			return
+		}
+		
+		mu.RLock()
+		var bids []*Order
+		var asks []*Order
+		
+		for _, o := range orders {
+			// Filters: V2, OPEN, Match Contract
+			if o.Version == 2 && o.Status == "OPEN" && o.DeliveryStart == start && o.DeliveryEnd == end {
+				if o.Side == "buy" {
+					bids = append(bids, o)
+				} else if o.Side == "sell" {
+					asks = append(asks, o)
+				}
+			}
+		}
+		mu.RUnlock()
+
+		// --- Sorting ---
+		
+		// Bids: Price DESC (Highest First), then Time ASC (Oldest First)
+		sort.Slice(bids, func(i, j int) bool {
+			if bids[i].Price != bids[j].Price {
+				return bids[i].Price > bids[j].Price // Highest price first
+			}
+			return bids[i].Timestamp < bids[j].Timestamp // Oldest time first
+		})
+		
+		// Asks: Price ASC (Lowest First), then Time ASC (Oldest First)
+		sort.Slice(asks, func(i, j int) bool {
+			if asks[i].Price != asks[j].Price {
+				return asks[i].Price < asks[j].Price // Lowest price first
+			}
+			return asks[i].Timestamp < asks[j].Timestamp // Oldest time first
+		})
+
+		// --- Response Construction ---
+		
+		bidsList := make([]map[string]GValue, 0, len(bids))
+		for _, o := range bids {
+			bidsList = append(bidsList, map[string]GValue{
+				"order_id": o.ID,
+				"price":    o.Price,
+				"quantity": o.Quantity,
+			})
+		}
+
+		asksList := make([]map[string]GValue, 0, len(asks))
+		for _, o := range asks {
+			asksList = append(asksList, map[string]GValue{
+				"order_id": o.ID,
+				"price":    o.Price,
+				"quantity": o.Quantity,
+			})
+		}
+		
+		resp := map[string]GValue{
+			"bids": bidsList,
+			"asks": asksList,
+		}
+		encoded, _ := EncodeMessage(resp)
+		w.Header().Set("Content-Type", "application/x-galacticbuf")
+		w.Write(encoded)
 		return
 	}
 
-	username, authOk := getUserFromToken(r)
-	if !authOk {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
+	// POST /v2/orders (Submit V2 - Auth Required)
+	if r.Method == http.MethodPost {
+		username, authOk := getUserFromToken(r)
+		if !authOk {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
 
-	data, err := DecodeMessage(r.Body)
-	if err != nil {
-		http.Error(w, "Bad Request", http.StatusBadRequest)
-		return
-	}
-
-	side, ok0 := data["side"].(string)
-	price, ok1 := data["price"].(int64)
-	quantity, ok2 := data["quantity"].(int64)
-	start, ok3 := data["delivery_start"].(int64)
-	end, ok4 := data["delivery_end"].(int64)
-
-	if !ok0 || !ok1 || !ok2 || !ok3 || !ok4 {
-		http.Error(w, "Missing fields", http.StatusBadRequest)
-		return
-	}
-
-	if side != "buy" && side != "sell" {
-		http.Error(w, "Invalid side", http.StatusBadRequest)
-		return
-	}
-
-	if quantity <= 0 {
-		http.Error(w, "Quantity must be positive", http.StatusBadRequest)
-		return
-	}
-	const hourMs = 3600000
-	if start%hourMs != 0 || end%hourMs != 0 || end <= start || (end-start) != hourMs {
-		http.Error(w, "Invalid Contract Timestamps", http.StatusBadRequest)
-		return
-	}
-
-	mu.Lock()
-	orderCounter++
-	orderID := fmt.Sprintf("ord-v2-%d", orderCounter)
-	newOrder := &Order{
-		ID:            orderID,
-		Price:         price,
-		Quantity:      quantity,
-		DeliveryStart: start,
-		DeliveryEnd:   end,
-		Owner:         username,
-		Status:        "OPEN",
-		Side:          side,
-		Version:       2,
-		Timestamp:     time.Now().UnixMilli(),
-	}
-	orders[orderID] = newOrder
-	mu.Unlock()
-
-	// FUTURE: Trigger Matching Engine Here
-
-	resp := map[string]GValue{"order_id": orderID}
-	encoded, _ := EncodeMessage(resp)
-	w.Header().Set("Content-Type", "application/x-galacticbuf")
-	w.Write(encoded)
-}
-
-// NEW HANDLER: V2 Modify / Cancel (PUT/DELETE /v2/orders/{id})
-func ordersV2ByIDHandler(w http.ResponseWriter, r *http.Request) {
-	// Extract ID from path: /v2/orders/{id}
-	// Note: We registered "/v2/orders/" so trimming prefix works
-	orderID := strings.TrimPrefix(r.URL.Path, "/v2/orders/")
-	if orderID == "" {
-		http.Error(w, "Missing Order ID", http.StatusNotFound)
-		return
-	}
-
-	username, authOk := getUserFromToken(r)
-	if !authOk {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	// --- MODIFY ORDER (PUT) ---
-	if r.Method == http.MethodPut {
 		data, err := DecodeMessage(r.Body)
 		if err != nil {
 			http.Error(w, "Bad Request", http.StatusBadRequest)
 			return
 		}
 
-		newPrice, ok1 := data["price"].(int64)
-		newQuantity, ok2 := data["quantity"].(int64)
+		side, ok0 := data["side"].(string)
+		price, ok1 := data["price"].(int64)
+		quantity, ok2 := data["quantity"].(int64)
+		start, ok3 := data["delivery_start"].(int64)
+		end, ok4 := data["delivery_end"].(int64)
 
-		if !ok1 || !ok2 {
-			http.Error(w, "Missing price or quantity", http.StatusBadRequest)
+		if !ok0 || !ok1 || !ok2 || !ok3 || !ok4 {
+			http.Error(w, "Missing fields", http.StatusBadRequest)
 			return
 		}
-		if newQuantity <= 0 {
+
+		if side != "buy" && side != "sell" {
+			http.Error(w, "Invalid side", http.StatusBadRequest)
+			return
+		}
+
+		if quantity <= 0 {
 			http.Error(w, "Quantity must be positive", http.StatusBadRequest)
 			return
 		}
+		const hourMs = 3600000
+		if start%hourMs != 0 || end%hourMs != 0 || end <= start || (end-start) != hourMs {
+			http.Error(w, "Invalid Contract Timestamps", http.StatusBadRequest)
+			return
+		}
 
 		mu.Lock()
-		defer mu.Unlock()
+		orderCounter++
+		orderID := fmt.Sprintf("ord-v2-%d", orderCounter)
+		newOrder := &Order{
+			ID:            orderID,
+			Price:         price,
+			Quantity:      quantity,
+			DeliveryStart: start,
+			DeliveryEnd:   end,
+			Owner:         username,
+			Status:        "OPEN",
+			Side:          side,
+			Version:       2,
+			Timestamp:     time.Now().UnixMilli(),
+		}
+		orders[orderID] = newOrder
+		mu.Unlock()
 
-		order, exists := orders[orderID]
-		if !exists || order.Status == "CANCELLED" {
-			http.Error(w, "Order not found", http.StatusNotFound)
-			return
-		}
-		// V2 check
-		if order.Version != 2 {
-			http.Error(w, "Order not found", http.StatusNotFound)
-			return
-		}
-		// Ownership check
-		if order.Owner != username {
-			http.Error(w, "Forbidden", http.StatusForbidden)
-			return
-		}
-		// Status check
-		if order.Status != "OPEN" {
-			http.Error(w, "Order not active", http.StatusNotFound)
-			return
-		}
-
-		// --- Time Priority Logic ---
-		// 1. Price change resets priority
-		// 2. Quantity increase resets priority
-		// 3. Quantity decrease preserves priority
-		if newPrice != order.Price || newQuantity > order.Quantity {
-			order.Timestamp = time.Now().UnixMilli()
-		}
-		
-		order.Price = newPrice
-		order.Quantity = newQuantity
-		
-		// FUTURE: Trigger Matching Engine Here
-
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	// --- CANCEL ORDER (DELETE) ---
-	if r.Method == http.MethodDelete {
-		mu.Lock()
-		defer mu.Unlock()
-
-		order, exists := orders[orderID]
-		if !exists || order.Status == "CANCELLED" {
-			http.Error(w, "Order not found", http.StatusNotFound)
-			return
-		}
-		if order.Version != 2 {
-			http.Error(w, "Order not found", http.StatusNotFound)
-			return
-		}
-		if order.Owner != username {
-			http.Error(w, "Forbidden", http.StatusForbidden)
-			return
-		}
-		if order.Status != "OPEN" {
-			http.Error(w, "Order not active", http.StatusNotFound) // Requirement says 404 if fully filled
-			return
-		}
-
-		order.Status = "CANCELLED"
-		w.WriteHeader(http.StatusNoContent)
+		resp := map[string]GValue{"order_id": orderID}
+		encoded, _ := EncodeMessage(resp)
+		w.Header().Set("Content-Type", "application/x-galacticbuf")
+		w.Write(encoded)
 		return
 	}
 	
@@ -698,6 +713,7 @@ func myOrdersHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 1. Auth Required
 	username, authOk := getUserFromToken(r)
 	if !authOk {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
@@ -705,19 +721,21 @@ func myOrdersHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mu.RLock()
+	// 2. Filter User's Active Orders
 	var myOrders []*Order
 	for _, o := range orders {
-		// Only show active orders (CANCELLED are hidden)
 		if o.Owner == username && o.Status == "OPEN" {
 			myOrders = append(myOrders, o)
 		}
 	}
 	mu.RUnlock()
 
+	// 3. Sort by Timestamp Descending (Newest First)
 	sort.Slice(myOrders, func(i, j int) bool {
 		return myOrders[i].Timestamp > myOrders[j].Timestamp
 	})
 
+	// 4. Construct Response
 	list := make([]map[string]GValue, 0, len(myOrders))
 	for _, o := range myOrders {
 		list = append(list, map[string]GValue{
@@ -789,6 +807,7 @@ func tradesHandler(w http.ResponseWriter, r *http.Request) {
 		defer mu.Unlock()
 
 		order, exists := orders[orderID]
+		// V1 endpoint only takes V1 orders
 		if !exists || order.Status != "OPEN" || order.Version != 1 {
 			http.Error(w, "Order not found or inactive", http.StatusNotFound)
 			return
@@ -832,10 +851,9 @@ func main() {
 	mux.HandleFunc("/user/password", passwordHandler)
 	
 	mux.HandleFunc("/orders", ordersV1Handler)
-	mux.HandleFunc("/v2/orders", ordersV2Handler) // Creates Order
-	mux.HandleFunc("/v2/orders/", ordersV2ByIDHandler) // Modify/Cancel (Requires ID)
-	
+	mux.HandleFunc("/v2/orders", ordersV2Handler)
 	mux.HandleFunc("/v2/my-orders", myOrdersHandler)
+	
 	mux.HandleFunc("/trades", tradesHandler)
 
 	log.Println("Galactic Exchange started on :8080")
